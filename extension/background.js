@@ -91,7 +91,7 @@ async function release() {
   const s = saved;
   const r = await call({ cmd: 'set', open: s.open, convRaw: s.conv,
     hwnd: s.hwnd, pid: s.pid, browser, restore: true });
-  if (r.ok || r.error === 'target window changed') saved = null;
+  if (r.ok || r.restored || r.error === 'target window changed') saved = null;
   return r;
 }
 
@@ -127,10 +127,10 @@ async function changeFocus(msg, sender) {
 
   const spec = held.get(nextField) || msg.spec;
   const r = await call({ cmd: 'set', ...spec, hwnd: saved?.hwnd || 0,
-    pid: saved?.pid, browser, ...(held.has(nextField) ? { held: true } : {}) });
+    pid: saved?.pid, browser, ...(held.has(nextField) ? { held: true, japanese: msg.spec.open === 1 } : {}) });
   // The host can change one setting successfully before another fails.
   // Retain the original state so blur can still undo a partial write.
-  if (!saved && r.hwnd && r.previous != null) {
+  if (!saved && r.hwnd && (r.previous != null || r.restorePending)) {
     saved = { hwnd: r.hwnd, pid: r.pid, open: r.previous, conv: r.previousConv, windowId };
   }
   if (saved) {

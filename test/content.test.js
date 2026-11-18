@@ -161,7 +161,7 @@ function check(name, actual, expected) {
     t.window.fire('blur');
     t.document.activeElement = el('hiragana');
     t.window.fire('focus');
-    t.document.fire('focusin', { target: el('hiragana') });
+    t.document.fire('focusin', { target: t.document.activeElement });
     check('focus と focusin の二重発火を重複排除', t.sent, ['hiragana', null, 'hiragana']);
   }
 
@@ -280,14 +280,15 @@ function check(name, actual, expected) {
     });
     t.document.fire('DOMContentLoaded', {});
     // prewarm は送られたが、まだ応答しない状態
-    t.document.fire('focusin', { target: el('hiragana') });
+    const field = el('hiragana');
+    t.document.fire('focusin', { target: field });
     await sleep(10);
     // ここで prewarm の失敗が届く。currentMode は 'hiragana' で上書きされている。
     rejectPrewarm(new Error('late'));
     await sleep(10);
     // 同じモードで再度フォーカスしても、forget() が呼ばれていなければ送らない。
     // forget() が呼ばれていれば currentMode が UNKNOWN になり、ここで再送される。
-    t.document.fire('focusin', { target: el('hiragana') });
+    t.document.fire('focusin', { target: field });
     check('prewarm が失敗しても適用は 1 回だけ', t.sent, ['prewarm', 'hiragana']);
   }
 
@@ -326,9 +327,10 @@ function check(name, actual, expected) {
   // 正常時は重複排除が効いていること（上の回復が緩すぎないことの裏取り）。
   {
     const t = loadContent();
-    t.document.fire('focusin', { target: el('hiragana') });
+    const field = el('hiragana');
+    t.document.fire('focusin', { target: field });
     await sleep(10);
-    t.document.fire('focusin', { target: el('hiragana') });
+    t.document.fire('focusin', { target: field });
     check('成功時は同じモードを再送しない', t.sent, ['hiragana']);
   }
 
@@ -340,10 +342,11 @@ function check(name, actual, expected) {
       sendImpl: () => (++n === 1 ? new Promise((_, rej) => { rejectFirst = rej; }) : REPLY.ack()),
     });
     t.document.fire('focusin', { target: el('hiragana') });
-    t.document.fire('focusin', { target: el('katakana') });
+    const field = el('katakana');
+    t.document.fire('focusin', { target: field });
     rejectFirst(new Error('late'));
     await sleep(10);
-    t.document.fire('focusin', { target: el('katakana') });
+    t.document.fire('focusin', { target: field });
     check('遅れて届いた失敗が新しい状態を消さない', t.sent, ['hiragana', 'katakana']);
   }
 
@@ -617,6 +620,17 @@ function check(name, actual, expected) {
     check('leaving the window after a held field still requests restoration',
       t.sentRaw.map(m => [m.mode, m.field ?? null, !!m.retain]),
       [['hiragana', 1, false], [null, null, true], [null, null, false]]);
+  }
+
+  {
+    const t = loadContent();
+    const a = el('katakana');
+    const b = el('katakana');
+    t.document.fire('focusin', { target: a });
+    t.document.fire('focusout', {});
+    t.document.fire('focusin', { target: b });
+    t.document.fire('focusin', { target: b });
+    check('different fields with the same mode each apply it once', t.sent, ['katakana', 'katakana']);
   }
 
   // ---- 結果 ----------------------------------------------------------------

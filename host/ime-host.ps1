@@ -12,6 +12,11 @@ using System.Runtime.InteropServices;
 public class ImeNative {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("imm32.dll")]  public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hWnd);
+    [DllImport("imm32.dll")] public static extern bool ImmIsIME(IntPtr layout);
+    [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
+    [DllImport("user32.dll")] public static extern int GetKeyboardLayoutList(int count, [Out] IntPtr[] layouts);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessage(
+        IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(
         IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
         uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
@@ -24,6 +29,7 @@ public class ImeNative {
 }
 "@
 
+$WM_INPUTLANGCHANGEREQUEST = 0x0050
 $WM_IME_CONTROL        = 0x0283
 $IMC_GETCONVERSIONMODE = 0x0001
 $IMC_SETCONVERSIONMODE = 0x0002
@@ -87,7 +93,8 @@ function Get-WindowLabel([IntPtr]$hWnd) {
 }
 
 # Safety net: whatever we last changed, put it back when the port dies.
-$script:lastChange = $null   # @{ hwnd = <IntPtr>; open = <int>; conv = <int> }
+$script:lastChange = $null
+$script:layoutChange = $null
 
 function Read-Exactly([int]$count) {
     $buf = New-Object byte[] $count
@@ -190,6 +197,9 @@ function Invoke-ImeRequest($req) {
             return @{ ok = $false; error = 'target window changed' }
         }
     }
+    if ($req.inputLayout -and (Get-WindowLayout $w.target) -ne $req.inputLayout) {
+        return @{ ok = $false; error = 'input language changed before applying IME mode' }
+    }
     if ($w.ime -eq [IntPtr]::Zero) {
         Write-DebugLog '  IME ウィンドウを取得できず'
         return @{ ok = $false; error = 'no IME window for target' }
@@ -233,7 +243,10 @@ function Invoke-ImeRequest($req) {
     $result = @{ ok = $false; hwnd = [int64]$w.target; pid = $targetPid;
         previous = $curOpen; previousConv = $curConv }
     if (!$req.restore -and $null -eq $script:lastChange) {
-        $script:lastChange = @{ hwnd = $w.target; pid = $targetPid; open = $curOpen; conv = $curConv }
+        $script:lastChange = @{
+            hwnd = $w.target; pid = $targetPid; browser = $req.browser
+            layout = $req.inputLayout; open = $curOpen; conv = $curConv
+        }
     }
 
     $mask = if ($convExact) { -1 } else { $CONV_MASK }
@@ -245,7 +258,15 @@ function Invoke-ImeRequest($req) {
             $result.error = 'setting IME open timed out'
             return $result
         }
-        $workingOpen = 1
+        for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            if ($attempt -gt 0) { Start-Sleep -Milliseconds 25 }
+            $workingOpen = Invoke-ImeControl $w.ime $IMC_GETOPENSTATUS 0
+            if ($workingOpen -eq 1) { break }
+        }
+        if ($workingOpen -ne 1) {
+            $result.error = 'IME did not open'
+            return $result
+        }
     }
     if ($writeConversion) {
         $workingConv = Invoke-ImeControl $w.ime $IMC_GETCONVERSIONMODE 0
@@ -266,12 +287,213 @@ function Invoke-ImeRequest($req) {
         $actualConv = Invoke-ImeControl $w.ime $IMC_GETCONVERSIONMODE 0
         if ($actualOpen -eq $open -and $null -ne $actualConv -and
             (!$needsConversion -or ($actualConv -band $mask) -eq ($convValue -band $mask))) {
+            if ($req.inputLayout -and (Get-WindowLayout $w.target) -ne $req.inputLayout) {
+                $result.error = 'input language changed while applying IME mode'
+                return $result
+            }
             $result.ok = $true
+            $result.expectedOpen = $open
+            $result.expectedConv = $convValue
+            $result.conversionMask = $mask
             if ($req.restore) { $script:lastChange = $null }
             return $result
         }
     }
     $result.error = 'IME did not apply the requested state'
+    return $result
+}
+
+function Get-WindowLayout([IntPtr]$target) {
+    $processId = [uint32]0
+    $thread = [ImeNative]::GetWindowThreadProcessId($target, [ref]$processId)
+    if (!$thread) { return [IntPtr]::Zero }
+    return [ImeNative]::GetKeyboardLayout($thread)
+}
+
+function Test-JapaneseLayout([IntPtr]$layout) {
+    return ($layout.ToInt64() -band 0xFFFF) -eq 0x0411 -and [ImeNative]::ImmIsIME($layout)
+}
+
+function Get-JapaneseLayout {
+    $count = [ImeNative]::GetKeyboardLayoutList(0, $null)
+    if ($count -gt 0) {
+        $layouts = New-Object IntPtr[] $count
+        $copied = [ImeNative]::GetKeyboardLayoutList($count, $layouts)
+        for ($i = 0; $i -lt $copied; $i++) {
+            if (Test-JapaneseLayout $layouts[$i]) { return $layouts[$i] }
+        }
+    }
+    return [IntPtr]::Zero
+}
+
+function Set-WindowLayout([IntPtr]$target, [IntPtr]$layout) {
+    if ((Get-WindowLayout $target) -eq $layout) { return $true }
+    if (![ImeNative]::PostMessage($target, $WM_INPUTLANGCHANGEREQUEST, [IntPtr]::Zero, $layout)) {
+        return $false
+    }
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+        Start-Sleep -Milliseconds 25
+        if ((Get-WindowLayout $target) -eq $layout) { return $true }
+    }
+    return $false
+}
+
+function Get-BrowserWindow($req, [bool]$requireForeground) {
+    $target = if ($req.hwnd) { [IntPtr][int64]$req.hwnd } else { [ImeNative]::GetForegroundWindow() }
+    $processId = [uint32]0
+    [void][ImeNative]::GetWindowThreadProcessId($target, [ref]$processId)
+    $process = if ($processId) { Get-Process -Id $processId -ErrorAction SilentlyContinue }
+    if (!$process -or $process.ProcessName -ne $req.browser -or
+        ($req.pid -and $req.pid -ne $processId) -or
+        ($requireForeground -and $target -ne [ImeNative]::GetForegroundWindow())) { return $null }
+    return @{ hwnd = $target; pid = $processId }
+}
+
+function Restore-BrowserMode($target, [string]$browser) {
+    $savedMode = $script:lastChange
+    if (!$savedMode) { return @{ ok = $true } }
+    if ($target.hwnd -ne $savedMode.hwnd -or $target.pid -ne $savedMode.pid) {
+        $script:lastChange = $null
+        return @{ ok = $false; error = 'target window changed' }
+    }
+    if ($savedMode.layout -ne (Get-WindowLayout $target.hwnd)) {
+        $script:lastChange = $null
+        return @{ ok = $true }
+    }
+    return (Invoke-ImeRequest @{
+        cmd = 'set'; hwnd = [int64]$target.hwnd; pid = $target.pid; browser = $browser
+        open = $savedMode.open; convRaw = $savedMode.conv; inputLayout = $savedMode.layout; restore = $true
+    })
+}
+
+function Restore-BrowserLayout($req) {
+    $savedLayout = $script:layoutChange
+    $target = Get-BrowserWindow $req $false
+    if (!$target -or $target.hwnd -ne $savedLayout.hwnd -or $target.pid -ne $savedLayout.pid) {
+        $script:layoutChange = $null
+        $script:lastChange = $null
+        return @{ ok = $false; error = 'target window changed' }
+    }
+
+    # If the user picked a different input language, leave that choice in place.
+    $active = Get-WindowLayout $target.hwnd
+    if ($active -ne $savedLayout.applied) {
+        $script:layoutChange = $null
+        $script:lastChange = $null
+        return @{ ok = $true }
+    }
+
+    $modeResult = Restore-BrowserMode $target $req.browser
+    if (!(Set-WindowLayout $target.hwnd $savedLayout.original)) {
+        return @{ ok = $false; error = 'original input language was not restored' }
+    }
+    $script:layoutChange = $null
+    $script:lastChange = $null
+    if (!$modeResult.ok) { $modeResult.restored = $true }
+    return $modeResult
+}
+
+function Confirm-BrowserImeMode($apply, $result) {
+    if (!$result.ok -or $apply.open -ne 1) { return $result }
+
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        # The browser's text input context can change after the first successful read.
+        Start-Sleep -Milliseconds 100
+        if (!(Get-BrowserWindow $apply $true)) {
+            $result.ok = $false
+            $result.error = 'target window changed after applying IME mode'
+            return $result
+        }
+        $actual = Invoke-ImeRequest @{
+            cmd = 'get'; hwnd = $apply.hwnd; pid = $apply.pid; browser = $apply.browser
+            inputLayout = $apply.inputLayout
+        }
+        if ($actual.ok -and $actual.open -eq $result.expectedOpen -and
+            ($null -eq $result.expectedConv -or
+                ($actual.conv -band $result.conversionMask) -eq ($result.expectedConv -band $result.conversionMask))) {
+            return $result
+        }
+        if ($attempt -eq 0) {
+            Write-DebugLog '  IME context changed after the first readback; applying the field mode again'
+            $retry = Invoke-ImeRequest $apply
+            if (!$retry.ok) {
+                $result.ok = $false
+                $result.error = $retry.error
+                return $result
+            }
+        }
+    }
+    $result.ok = $false
+    $result.error = 'IME did not retain the requested state'
+    return $result
+}
+
+function Invoke-BrowserImeRequest($req) {
+    if (!$req.browser -or $req.cmd -ne 'set') { return (Invoke-ImeRequest $req) }
+    if ($req.restore) {
+        if ($null -ne $script:layoutChange) { return (Restore-BrowserLayout $req) }
+        if (!$script:lastChange) { return @{ ok = $true } }
+        $target = Get-BrowserWindow $req $false
+        if (!$target) {
+            $script:lastChange = $null
+            return @{ ok = $false; error = 'target window changed' }
+        }
+        return (Restore-BrowserMode $target $req.browser)
+    }
+
+    $target = Get-BrowserWindow $req $true
+    if (!$target) { return @{ ok = $false; error = 'target window changed' } }
+    $apply = @{
+        cmd = 'set'; hwnd = [int64]$target.hwnd; pid = $target.pid; browser = $req.browser
+        open = $req.open; conv = $req.conv; convRaw = $req.convRaw; held = $req.held
+    }
+
+    $current = Get-WindowLayout $target.hwnd
+    if ($current -eq [IntPtr]::Zero) { return @{ ok = $false; error = 'cannot read active input language' } }
+    $apply.inputLayout = $current
+    if ($script:layoutChange -and $current -ne $script:layoutChange.applied) {
+        # The user changed input language while the field was focused.
+        $script:layoutChange = $null
+        $script:lastChange = $null
+    } elseif ($script:lastChange -and $current -ne $script:lastChange.layout) {
+        $script:lastChange = $null
+    }
+    if (($req.open -ne 1 -and !$req.japanese) -or (Test-JapaneseLayout $current)) {
+        $result = Invoke-ImeRequest $apply
+        if ($req.open -eq 1 -and $result.previous -eq 0) {
+            return (Confirm-BrowserImeMode $apply $result)
+        }
+        return $result
+    }
+
+    $japanese = Get-JapaneseLayout
+    if ($japanese -eq [IntPtr]::Zero) {
+        return @{ ok = $false; error = 'no installed Japanese IME layout found' }
+    }
+
+    # An inactive field may have changed the previous IME before entering this field.
+    $previous = Restore-BrowserMode $target $req.browser
+    if (!$previous.ok) { return $previous }
+
+    if (!(Get-BrowserWindow $apply $true)) { return @{ ok = $false; error = 'target window changed' } }
+    $script:layoutChange = @{
+        hwnd = $target.hwnd; pid = $target.pid; browser = $req.browser
+        original = $current; applied = $japanese
+    }
+    Write-DebugLog ('  input layout: 0x{0:X} -> 0x{1:X}' -f $current.ToInt64(), $japanese.ToInt64())
+    if (!(Set-WindowLayout $target.hwnd $japanese)) {
+        return @{ ok = $false; error = 'browser did not activate the Japanese IME layout';
+            hwnd = [int64]$target.hwnd; pid = $target.pid; restorePending = $true }
+    }
+
+    # Re-resolve the IME window after the language change.
+    $apply.inputLayout = $japanese
+    $result = Confirm-BrowserImeMode $apply (Invoke-ImeRequest $apply)
+    if (!$result.ok) {
+        $result.hwnd = [int64]$target.hwnd
+        $result.pid = $target.pid
+        $result.restorePending = $true
+    }
     return $result
 }
 
@@ -284,7 +506,7 @@ try {
         try {
             $req = $raw | ConvertFrom-Json
             $id = $req.id
-            $resp = Invoke-ImeRequest $req
+            $resp = Invoke-BrowserImeRequest $req
         } catch {
             $resp = @{ ok = $false; error = "$_" }
         }
@@ -295,7 +517,14 @@ try {
 finally {
     # Port died (service worker evicted, extension disabled, browser closed).
     # Never strand the user with the IME in a state they did not choose.
-    if ($null -ne $script:lastChange) {
+    if ($null -ne $script:layoutChange) {
+        $saved = $script:layoutChange
+        Restore-BrowserLayout @{ hwnd = [int64]$saved.hwnd; pid = $saved.pid; browser = $saved.browser } | Out-Null
+    } elseif ($script:lastChange.browser) {
+        $saved = $script:lastChange
+        Invoke-BrowserImeRequest @{ cmd = 'set'; hwnd = [int64]$saved.hwnd; pid = $saved.pid;
+            browser = $saved.browser; restore = $true } | Out-Null
+    } elseif ($null -ne $script:lastChange) {
         Invoke-ImeRequest @{ cmd = 'set'; hwnd = [int64]$script:lastChange.hwnd;
             pid = $script:lastChange.pid; open = $script:lastChange.open;
             convRaw = $script:lastChange.conv; restore = $true } | Out-Null

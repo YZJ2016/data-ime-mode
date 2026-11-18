@@ -26,11 +26,21 @@ function Invoke-ImeControl($imeWnd, $cmd, $value) {
         2 {
             $script:written = $value
             if ($script:writeTimeout) { return $null }
-            if (!$script:ignoreWrite) { $script:conv = $value }
+            if (!$script:ignoreWrite -and !$script:openPending) { $script:conv = $value }
             return 0
         }
-        5 { return $script:open }
-        6 { $script:open = $value; return 0 }
+        5 {
+            if ($script:openPending) {
+                $script:openPending--
+                if (!$script:openPending) { $script:open = 1 }
+            }
+            return $script:open
+        }
+        6 {
+            if ($script:delayOpen -and $value -eq 1) { $script:openPending = 2 }
+            else { $script:open = $value }
+            return 0
+        }
     }
 }
 function Write-DebugLog($msg) { }
@@ -114,6 +124,122 @@ Check-Request 'full alphanumeric retains ROMAN flag' 'full-alphanumeric' $false 
 Check-Request 'half alphanumeric clears NATIVE and FULLSHAPE' 'half-alphanumeric' $false $false $true 0x10 ''
 Check-Request 'accepted but ignored write fails readback' 'full-alphanumeric' $true $false $false 0x19 'IME did not apply the requested state'
 Check-Request 'write timeout is propagated' 'full-alphanumeric' $false $true $false 0x19 'setting IME conversion mode timed out'
+
+$script:open = 0
+$script:conv = 0x19
+$script:delayOpen = $true
+$script:ignoreWrite = $false
+$script:writeTimeout = $false
+$script:lastChange = $null
+$r = Invoke-ImeRequest @{ cmd = 'set'; hwnd = 42; open = 1; conv = 'full-katakana' }
+$results += [pscustomobject]@{
+    Name = 'waits for Japanese IME to open before setting katakana'
+    Ok = ($r.ok -and $script:conv -eq 0x1B)
+    Expected = 'IME open and full katakana'
+    Actual = "$($r.ok) / $($script:conv) / $($r.error)"
+}
+
+# Exercise the browser request path with recorded layout and mode operations.
+foreach ($functionName in 'Restore-BrowserMode', 'Restore-BrowserLayout', 'Confirm-BrowserImeMode', 'Invoke-BrowserImeRequest') {
+    $definition = $ast.Find({
+        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $args[0].Name -eq $functionName
+    }, $true)
+    Invoke-Expression $definition.Extent.Text
+}
+$zh = [IntPtr]0x08040804
+$ja = [IntPtr]0x04110411
+function Get-BrowserWindow($req, $foreground) { return @{ hwnd = [IntPtr]42; pid = 123 } }
+function Get-WindowLayout($hwnd) { return $script:layout }
+function Test-JapaneseLayout($layout) { return $layout -eq $ja }
+function Get-JapaneseLayout { return $ja }
+function Set-WindowLayout($hwnd, $layout) {
+    $script:actions += "layout:$($layout.ToInt64())"
+    if ($script:rejectLayout) { return $false }
+    $script:layout = $layout
+    return $true
+}
+function Invoke-ImeRequest($req) {
+    if ($req.cmd -eq 'get') { return @{ ok = $true; open = 1; conv = 11 } }
+    $script:actions += "mode:$($script:layout.ToInt64()):$($req.conv)"
+    if ($req.restore) { $script:lastChange = $null }
+    else {
+        $script:lastChange = @{ hwnd = [IntPtr]42; pid = 123; layout = $req.inputLayout;
+            open = 0; conv = 0x19 }
+    }
+    return @{ ok = $true; hwnd = 42; previous = 0; previousConv = 0x19;
+        expectedOpen = 1; expectedConv = 11; conversionMask = 11 }
+}
+function Check-BrowserRequest($name, $actual, $expected) {
+    $script:results += [pscustomobject]@{
+        Name = $name; Ok = ($actual -eq $expected); Expected = $expected; Actual = $actual
+    }
+}
+$apply = @{ cmd = 'set'; browser = 'chrome'; hwnd = 42; open = 1; conv = 'full-katakana' }
+$restore = @{ cmd = 'set'; browser = 'chrome'; hwnd = 42; restore = $true }
+$script:layout = $ja
+$script:actions = @()
+$script:lastChange = $null
+$script:layoutChange = $null
+Invoke-BrowserImeRequest $apply | Out-Null
+Check-BrowserRequest 'Japanese layout is already active: only switch mode' ($script:actions -join ',') "mode:$($ja.ToInt64()):full-katakana"
+
+$script:layout = $zh
+$script:actions = @()
+$script:lastChange = $null
+Invoke-BrowserImeRequest $apply | Out-Null
+Invoke-BrowserImeRequest $restore | Out-Null
+Check-BrowserRequest 'select Japanese first; restore Japanese mode, then original language' (
+    $script:actions -join ','
+) "layout:$($ja.ToInt64()),mode:$($ja.ToInt64()):full-katakana,mode:$($ja.ToInt64()):,layout:$($zh.ToInt64())"
+
+$script:actions = @()
+$script:rejectLayout = $true
+$r = Invoke-BrowserImeRequest $apply
+Check-BrowserRequest 'rejected layout request does not write a conversion mode' (
+    "$($r.ok) / $($script:actions -join ',')"
+) "False / layout:$($ja.ToInt64())"
+$script:rejectLayout = $false
+Invoke-BrowserImeRequest $restore | Out-Null
+
+$script:actions = @()
+Invoke-BrowserImeRequest $apply | Out-Null
+$script:layout = [IntPtr]0x04090409
+Invoke-BrowserImeRequest $restore | Out-Null
+Check-BrowserRequest 'leaving a field preserves a later manual input-language selection' (
+    $script:layout.ToInt64()
+) 0x04090409
+
+# After a layout handoff the initial readback can still reflect the old
+# IME context; simulate the new context starting in direct input.
+$script:modeWrites = 0
+$script:layout = $zh
+$script:layoutChange = $null
+$script:lastChange = $null
+function Invoke-ImeRequest($req) {
+    if ($req.cmd -eq 'get') {
+        if ($script:modeWrites -eq 1 -or $script:alwaysDirect) {
+            return @{ ok = $true; open = 0; conv = 9 }
+        }
+        return @{ ok = $true; open = 1; conv = 11 }
+    }
+    $script:modeWrites++
+    return @{ ok = $true; hwnd = 42; previous = 0; previousConv = 9;
+        expectedOpen = 1; expectedConv = 11; conversionMask = 11 }
+}
+$verifiedMode = Invoke-BrowserImeRequest $apply
+Check-BrowserRequest 'layout handoff reapplies katakana if the next context opens in direct input' (
+    "$($verifiedMode.ok) / $script:modeWrites"
+) 'True / 2'
+
+$script:alwaysDirect = $true
+$script:modeWrites = 0
+$script:layout = $zh
+$script:layoutChange = $null
+$verifiedMode = Invoke-BrowserImeRequest $apply
+Check-BrowserRequest 'a persistent reset does not report success or retry forever' (
+    "$($verifiedMode.ok) / $script:modeWrites / $($verifiedMode.restorePending)"
+) 'False / 2 / True'
 
 $bad = 0
 foreach ($r in $results) {

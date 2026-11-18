@@ -51,6 +51,7 @@ function prewarm() {
 
 let currentMode = null;
 let currentField = null;
+let currentElement = null;
 let retained = false;
 let request = 0;
 let nextField = 0;
@@ -74,12 +75,13 @@ function modeOf(el) {
 // The send did not land, so we must not keep claiming the mode is applied -
 // apply()'s dedupe would swallow every retry. Only clear if nothing newer has
 // been applied in the meantime.
-function apply(mode, field = null, withinDocument = false) {
-  if (mode === currentMode && field === currentField &&
+function apply(mode, field = null, withinDocument = false, element = null) {
+  if (mode === currentMode && field === currentField && element === currentElement &&
       !(mode === null && retained && !withinDocument)) return;
   retained = withinDocument && mode === null && (currentField !== null || retained);
   currentMode = mode;
   currentField = field;
+  currentElement = element;
   const id = ++request;
   const forget = () => {
     if (request === id) currentMode = UNKNOWN;
@@ -108,10 +110,11 @@ document.addEventListener('focusin', (e) => {
   cancelRelease();
   if (!document.hasFocus()) return;
   const mode = modeOf(e.target);
-  apply(mode, mode ? holdId(e.target) : null, true);
+  apply(mode, mode ? holdId(e.target) : null, true, mode ? e.target : null);
 }, true);
 
 document.addEventListener('focusout', () => {
+  currentElement = null;
   cancelRelease();
   releaseTimer = setTimeout(() => {
     releaseTimer = null;
@@ -137,7 +140,7 @@ function reapplyNow() {
   cancelRelease();
   const el = document.activeElement;
   const mode = modeOf(el);
-  apply(mode, mode ? holdId(el) : null, true);
+  apply(mode, mode ? holdId(el) : null, true, mode ? el : null);
 }
 
 window.addEventListener('blur', releaseNow);
