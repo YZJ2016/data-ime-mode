@@ -1,4 +1,4 @@
-# ime-host.ps1 の変換モード計算だけを単体で確認する。
+﻿# ime-host.ps1 の変換モード計算だけを単体で確認する。
 # 実ソースから関数定義を AST で取り出し、Win32 呼び出しはスタブに差し替える。
 # IME には一切触らない。
 #
@@ -20,9 +20,25 @@ if ($fn.Count -ne 1) { throw "Set-ConversionBits が見つかりません (見�
 
 # 依存をスタブ化してから、実物の関数定義を読み込む。
 $script:written = $null
-function Invoke-ImeControl($imeWnd, $cmd, $value) { $script:written = $value; return 0 }
+function Invoke-ImeControl($imeWnd, $cmd, $value) {
+    switch ($cmd) {
+        1 { return $script:conv }
+        2 {
+            $script:written = $value
+            if ($script:writeTimeout) { return $null }
+            if (!$script:ignoreWrite) { $script:conv = $value }
+            return 0
+        }
+        5 { return $script:open }
+        6 { $script:open = $value; return 0 }
+    }
+}
 function Write-DebugLog($msg) { }
 $CONV_MASK = 0x000B
+$IMC_GETCONVERSIONMODE = 1
+$IMC_SETCONVERSIONMODE = 2
+$IMC_GETOPENSTATUS = 5
+$IMC_SETOPENSTATUS = 6
 
 Invoke-Expression $fn[0].Extent.Text
 
@@ -63,6 +79,41 @@ Check '*復帰 ROMAN を含む値を欠けずに書き戻す'      0x0003 0x0019
 Check '*復帰 現在値と同じなら書かない'              0x0019 0x0019 $true $null
 Check '*復帰 変換モード無し (0x0000) へ戻せる'      0x0009 0x0000 $true 0x0000
 Check '*復帰 非マスクビットのみ異なる場合も書き直す' 0x0009 0x0019 $true 0x0019
+
+# Run the real request handler against an IME that may acknowledge and ignore a write.
+$handler = $ast.Find({
+    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $args[0].Name -eq 'Invoke-ImeRequest'
+}, $true)
+$flags = $ast.Find({
+    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $args[0].Left.Extent.Text -eq '$CONV_BITS'
+}, $true)
+$IME_CMODE_NATIVE = 1
+$IME_CMODE_KATAKANA = 2
+$IME_CMODE_FULLSHAPE = 8
+Invoke-Expression $flags.Extent.Text
+Invoke-Expression $handler.Extent.Text
+function Resolve-ImeWnd($hwnd) { return @{ target = [IntPtr]42; ime = [IntPtr]43 } }
+
+function Check-Request($name, $mode, $ignore, $timeout, $ok, $expectedConv, $expectedError) {
+    $script:open = 1
+    $script:conv = 0x19
+    $script:ignoreWrite = $ignore
+    $script:writeTimeout = $timeout
+    $script:lastChange = $null
+    $r = Invoke-ImeRequest @{ cmd = 'set'; hwnd = 42; open = 1; conv = $mode }
+    $actual = "$($r.ok) / $($script:conv) / $($r.error)"
+    $expected = "$ok / $expectedConv / $expectedError"
+    $script:results += [pscustomobject]@{
+        Name = $name; Ok = ($actual -eq $expected -and $r.previousConv -eq 0x19)
+        Expected = $expected; Actual = $actual
+    }
+}
+Check-Request 'full alphanumeric retains ROMAN flag' 'full-alphanumeric' $false $false $true 0x18 ''
+Check-Request 'half alphanumeric clears NATIVE and FULLSHAPE' 'half-alphanumeric' $false $false $true 0x10 ''
+Check-Request 'accepted but ignored write fails readback' 'full-alphanumeric' $true $false $false 0x19 'IME did not apply the requested state'
+Check-Request 'write timeout is propagated' 'full-alphanumeric' $false $true $false 0x19 'setting IME conversion mode timed out'
 
 $bad = 0
 foreach ($r in $results) {

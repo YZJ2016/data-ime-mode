@@ -375,27 +375,26 @@ function check(name, actual, expected) {
     check('prewarm を 2 回送っても connectNative は 1 回だけ (単一プロセス化ガード)', connectStats.count, 1);
   }
 
-  // ---- background.js: 受領の応答 -------------------------------------------
-  //
-  // 応答しないとポートが無応答で閉じ、content 側の Promise が reject する。
-  // 「届いた」と「届かなかった」が区別できなくなる根本原因なので、ここで止める。
+  // Applying an IME mode waits for the host's verified result.
   {
-    const { listener, posted } = loadBackground();
-
-    let responded = false;
-    listener(
+    const { listener, posted } = loadBackground({
+      respond: m => ({ id: m.id, ok: false, error: 'IME did not apply the requested state',
+        hwnd: 1, previous: 0, previousConv: 0x19 }),
+    });
+    let reply;
+    const keepOpen = listener(
       { type: 'ime', mode: 'hiragana', spec: { open: 1, conv: 'hiragana' } },
       {},
-      () => { responded = true; },
+      result => { reply = result; },
     );
-    check('background が受領を同期的に応答する', responded, true);
-
-    let respondedOnRelease = false;
-    listener({ type: 'ime', mode: null, spec: null }, {}, () => { respondedOnRelease = true; });
-    check('background が復帰要求にも応答する', respondedOnRelease, true);
-
-    await sleep(10);
-    check('background がホストへ set を送る', posted.length > 0 && posted[0].cmd, 'set');
+    check('focus request keeps response channel open', keepOpen, true);
+    check('focus request does not report success before set', reply, undefined);
+    await sleep(15);
+    check('background sends set to host', posted[0]?.cmd, 'set');
+    check('verified host failure reaches the caller', reply?.ok, false);
+    listener({ type: 'ime', spec: null }, {}, () => {});
+    await sleep(15);
+    check('partial write still has a restoration snapshot', posted.at(-1)?.restore, true);
   }
 
   // ---- background.js: prewarm を独立したコンテキストでテスト ----
@@ -431,10 +430,8 @@ function check(name, actual, expected) {
       {},
       () => { respondedAcquire = true; },
     );
-    check('background が acquire に応答する', respondedAcquire, true);
-
-    // queue に set が投稿されるのを待つ
     await sleep(50);
+    check('background reports result after host confirmed set', respondedAcquire, true);
 
     // saved が確立された状態で prewarm を送る
     posted.length = 0;
@@ -489,8 +486,7 @@ function check(name, actual, expected) {
 
   // ---- background.js: popup からの疎通確認 (probe) -------------------------
   //
-  // probe だけは応答を非同期に返す。'ime' 側を巻き込んで async にすると、
-  // 受領の同期応答（上のアサーション）が壊れて reject と区別できなくなる。
+  // Probe waits for ping and never changes IME state.
   {
     const { listener, posted } = loadBackground({
       respond: (m) => (m.cmd === 'ping' ? { id: m.id, ok: true } : undefined),
@@ -562,6 +558,65 @@ function check(name, actual, expected) {
     );
     check('無応答は no-response', classify({ ok: false, error: 'timeout' }), 'no-response');
     check('どれとも言えなければ unknown', classify({ ok: false, error: 'weird' }), 'unknown');
+  }
+
+  {
+    const t = loadContent();
+    t.document.fire('focusin', { target: el('full-alphanumeric') });
+    t.document.fire('focusin', { target: el('half-alphanumeric') });
+    check('explicit alphanumeric conversion requests', t.sentRaw.map(m => m.spec?.conv),
+      ['full-alphanumeric', 'half-alphanumeric']);
+  }
+
+  {
+    const { listener, posted } = loadBackground({
+      respond: m => ({ id: m.id, ok: true, hwnd: 1, previous: 0, previousConv: 0x19 }),
+    });
+    const a = { tab: { id: 1, windowId: 2 }, frameId: 1, documentId: 'a' };
+    const b = { ...a, frameId: 2, documentId: 'b' };
+    listener({ type: 'ime', spec: { open: 1, conv: 'hiragana' } }, a, () => {});
+    listener({ type: 'ime', spec: { open: 0, conv: null } }, b, () => {});
+    listener({ type: 'ime', spec: null }, a, () => {});
+    await sleep(30);
+    check('previous frame cannot restore over the focused frame',
+      posted.filter(m => m.restore).length, 0);
+  }
+
+  {
+    const { listener, posted } = loadBackground({
+      respond: m => m.cmd === 'get'
+        ? { id: m.id, ok: true, open: 1, conv: 0x13 }
+        : { id: m.id, ok: true, hwnd: 1, previous: 0, previousConv: 0x19 },
+    });
+    const sender = { tab: { id: 1, windowId: 2 }, frameId: 0, documentId: 'form' };
+    const select = (field) => listener(
+      { type: 'ime', field, spec: { open: 1, conv: 'hiragana' } }, sender, () => {});
+    select(1);
+    select(2);
+    select(1);
+    await sleep(30);
+    check('return to a held field uses the mode read when it lost focus',
+      [posted.at(-1)?.held, posted.at(-1)?.convRaw], [true, 0x13]);
+  }
+
+  {
+    const t = loadContent({ sendImpl: () => Promise.resolve({ ok: false }) });
+    t.document.fire('focusin', { target: el('hiragana') });
+    await sleep(10);
+    t.document.fire('focusin', { target: el('hiragana') });
+    check('failed native verification allows same mode to be retried', t.sent,
+      ['hiragana', 'hiragana']);
+  }
+
+  {
+    const t = loadContent();
+    const held = { getAttribute: n => ({ 'data-ime-mode': 'hiragana', 'data-ime-hold': 'true' })[n] };
+    t.document.fire('focusin', { target: held });
+    t.document.fire('focusin', { target: el(null) });
+    t.window.fire('blur');
+    check('leaving the window after a held field still requests restoration',
+      t.sentRaw.map(m => [m.mode, m.field ?? null, !!m.retain]),
+      [['hiragana', 1, false], [null, null, true], [null, null, false]]);
   }
 
   // ---- 結果 ----------------------------------------------------------------

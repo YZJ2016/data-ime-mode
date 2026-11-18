@@ -56,8 +56,24 @@
 <label>10. 他アプリへの往復</label>
 <input type="text" data-ime-mode="hiragana" placeholder="あ の状態にしてから Alt+Tab">
 <p class="note">この欄にフォーカスしたまま Alt+Tab で他アプリへ移ると、そちらの IME は
-元のまま（＝拡張機能は手を出さない）。Edge に戻ると再び <code>あ</code> になること。
+元のまま（＝拡張機能は手を出さない）。ブラウザに戻ると再び <code>あ</code> になること。
 別のタブに切り替えて戻す操作でも同じ。</p>
+
+<label for="full-alpha">11. 全角英数字</label>
+<input id="full-alpha" data-ime-mode="full-alphanumeric" placeholder="ＡＢＣ１２３">
+<label for="half-alpha">半角英数字</label>
+<input id="half-alpha" data-ime-mode="half-alphanumeric" placeholder="ABC123">
+<p class="note">両方に ABC123 と入力し、必要なら変換を確定して比較してください。</p>
+
+<label for="hold-ime">12. 入力モード保持</label>
+<input id="hold-ime" data-ime-mode="hiragana" data-ime-hold="true">
+<input aria-label="モード指定なし">
+<p class="note">保持欄の IME を手動で別のモードに変え、別の欄へ移動して戻ったときに切り替えたモードが復元されることを確認してください。</p>
+
+<label for="before-iframe">13. iframe へのフォーカス移動</label>
+<input id="before-iframe" data-ime-mode="inactive">
+<iframe title="半角カタカナの入力欄" src="frame.html"></iframe>
+<p class="note">Tab と Shift+Tab で iframe を往復し、移動前の欄の復帰処理が次の入力モードを上書きしないことを確認してください。</p>
 
 <script>
   document.getElementById('add').addEventListener('click', () => {

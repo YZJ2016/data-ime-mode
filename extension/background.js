@@ -14,7 +14,12 @@ const waiters = new Map();
 let lastDisconnect = null;
 
 // The window we touched and the IME state it had before we touched it.
-let saved = null; // { hwnd, open, conv }
+let saved = null; // { hwnd, pid, open, conv, windowId }
+let owner = null;
+let field = null;
+const held = new Map();
+const browser = typeof navigator === 'undefined' ? undefined :
+  (/\bEdg\//.test(navigator.userAgent) ? 'msedge' : 'chrome');
 
 // Requests are serialized: focus events arrive faster than the round trip,
 // and out-of-order set/restore would leave the IME in the wrong state.
@@ -39,6 +44,8 @@ function connect() {
     if (err) console.warn('[data-ime-mode] native host disconnected:', err.message);
     port = null;
     saved = null;
+    owner = null;
+    field = null;
     for (const resolve of waiters.values()) resolve({ ok: false, error: 'disconnected' });
     waiters.clear();
   });
@@ -69,27 +76,68 @@ function call(req) {
   });
 }
 
-async function release() {
-  if (!saved) return;
-  const s = saved;
-  saved = null;
-  await call({ cmd: 'set', open: s.open, convRaw: s.conv, hwnd: s.hwnd, restore: true });
+async function rememberField() {
+  if (!field || !saved) return;
+  const r = await call({ cmd: 'get', hwnd: saved.hwnd, pid: saved.pid, browser });
+  if (!r.ok) return;
+  // Bound the cache across SPA rerenders and closed documents.
+  held.delete(field);
+  held.set(field, { open: r.open, convRaw: r.conv });
+  if (held.size > 512) held.delete(held.keys().next().value);
 }
 
-async function acquire(spec) {
-  if (saved) {
-    // Already holding this window; just retarget it, keeping the originally
-    // captured state so the eventual restore is still correct.
-    await call({ cmd: 'set', open: spec.open, conv: spec.conv, hwnd: saved.hwnd });
-    return;
+async function release() {
+  if (!saved) return { ok: true };
+  const s = saved;
+  const r = await call({ cmd: 'set', open: s.open, convRaw: s.conv,
+    hwnd: s.hwnd, pid: s.pid, browser, restore: true });
+  if (r.ok || r.error === 'target window changed') saved = null;
+  return r;
+}
+
+async function changeFocus(msg, sender) {
+  const { windowId } = sender.tab || {};
+  const source = JSON.stringify([sender.tab?.id, sender.frameId, sender.documentId]);
+  if (!msg.spec && source !== owner) return { ok: true };
+
+  if (msg.spec && sender.tab && chrome.tabs && chrome.windows) {
+    const [tab, win] = await Promise.all([
+      chrome.tabs.get(sender.tab.id), chrome.windows.get(windowId),
+    ]);
+    if (!tab.active || !win.focused || tab.windowId !== windowId) {
+      return { ok: false, error: 'browser tab lost focus' };
+    }
   }
 
-  const r = await call({ cmd: 'set', open: spec.open, conv: spec.conv, hwnd: 0 });
-  if (r && r.ok) {
-    saved = { hwnd: r.hwnd, open: r.previous, conv: r.previousConv };
-  } else if (r) {
-    console.warn('[data-ime-mode]', r.error);
+  const nextField = msg.field != null ? JSON.stringify([source, msg.field]) : null;
+  const previousField = field;
+  if (field !== nextField || source !== owner) await rememberField();
+  if (!msg.spec) {
+    field = null;
+    if (msg.retain && previousField && saved) return { ok: true };
+    const r = await release();
+    if (r.ok) owner = null;
+    return r;
   }
+
+  if (saved && saved.windowId !== windowId) {
+    const r = await release();
+    if (!r.ok && saved) return r;
+  }
+
+  const spec = held.get(nextField) || msg.spec;
+  const r = await call({ cmd: 'set', ...spec, hwnd: saved?.hwnd || 0,
+    pid: saved?.pid, browser, ...(held.has(nextField) ? { held: true } : {}) });
+  // The host can change one setting successfully before another fails.
+  // Retain the original state so blur can still undo a partial write.
+  if (!saved && r.hwnd && r.previous != null) {
+    saved = { hwnd: r.hwnd, pid: r.pid, open: r.previous, conv: r.previousConv, windowId };
+  }
+  if (saved) {
+    owner = source;
+    field = nextField;
+  }
+  return r;
 }
 
 function enqueue(fn) {
@@ -101,9 +149,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || msg.type !== 'ime') return;
 
   // popup からの疎通確認。ホストへ実際に ping を通し、結果を非同期に返す。
-  // ここだけ true を返してチャネルを開けたままにする。下の 'ime' 側は
-  // 受領を同期的に返す必要があるので（README 「送信に失敗したとき」①）、
-  // リスナ全体を async にはしない。
+  // Return true to keep the response channel open while the host replies.
   if (msg.probe) {
     enqueue(() =>
       call({ cmd: 'ping' }).then((r) => {
@@ -124,11 +170,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return;
   }
 
-  enqueue(() => (msg.spec ? acquire(msg.spec) : release()));
-  // 受領だけを即座に返す。応答しないとポートが無応答のまま閉じ、送信側の
-  // Promise が reject するため、content.js から「届いた」と「届かなかった」が
-  // 区別できなくなる。実際の適用は queue 上で進むので完了は待たない。
-  sendResponse({ ok: true });
+  enqueue(async () => {
+    let result;
+    try {
+      result = await changeFocus(msg, _sender);
+    } catch (error) {
+      result = { ok: false, error: String(error) };
+    }
+    if (!result.ok) console.warn('[data-ime-mode]', result.error);
+    sendResponse(result);
+  });
+  return true;
 });
 
 // An open native port keeps the service worker alive, but a periodic message

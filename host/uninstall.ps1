@@ -1,17 +1,22 @@
-param([string]$HostName = 'io.github.fukunagajiro.data_ime_mode')
+﻿param([ValidatePattern('^[a-z0-9_]+(\.[a-z0-9_]+)*$')][string]$HostName = 'io.github.fukunagajiro.data_ime_mode')
 
 $ErrorActionPreference = 'Stop'
 
-$key = "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$HostName"
-if (Test-Path $key) {
-    Remove-Item -Path $key -Recurse -Force
-    Write-Host "レジストリキーを削除しました: $key"
-} else {
-    Write-Host "レジストリキーは見つかりませんでした: $key"
+$keys = @(
+    "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$HostName"
+    "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
+)
+foreach ($key in $keys) {
+    if (Test-Path $key) {
+        Remove-Item -LiteralPath $key -Force
+        Write-Host "レジストリキーを削除しました: $key"
+    } else {
+        Write-Host "レジストリキーは見つかりませんでした: $key"
+    }
 }
 
 $manPath = Join-Path $PSScriptRoot "$HostName.json"
 if (Test-Path $manPath) {
-    Remove-Item -Path $manPath -Force
+    Remove-Item -LiteralPath $manPath -Force
     Write-Host "マニフェストを削除しました: $manPath"
 }

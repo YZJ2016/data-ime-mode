@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # Native Messaging host for the data-ime-mode extension.
 # Speaks Chromium's stdio protocol (4-byte native-order length prefix + UTF-8 JSON)
 # and drives the IME open state / conversion mode of a target window via WM_IME_CONTROL.
@@ -41,6 +41,8 @@ $IME_CMODE_FULLSHAPE = 0x0008
 $CONV_MASK = $IME_CMODE_NATIVE -bor $IME_CMODE_KATAKANA -bor $IME_CMODE_FULLSHAPE
 
 $CONV_BITS = @{
+    'full-alphanumeric' = $IME_CMODE_FULLSHAPE
+    'half-alphanumeric' = 0
     'hiragana'      = $IME_CMODE_NATIVE -bor $IME_CMODE_FULLSHAPE                          # 0x09
     'full-katakana' = $IME_CMODE_NATIVE -bor $IME_CMODE_KATAKANA -bor $IME_CMODE_FULLSHAPE  # 0x0B
     'half-katakana' = $IME_CMODE_NATIVE -bor $IME_CMODE_KATAKANA                            # 0x03
@@ -178,6 +180,16 @@ function Invoke-ImeRequest($req) {
     if ($null -ne $req.hwnd) { $hwndIn = [int64]$req.hwnd }
     $w = Resolve-ImeWnd $hwndIn
 
+    $targetPid = [uint32]0
+    if ($req.browser -or $req.pid) {
+        [void][ImeNative]::GetWindowThreadProcessId($w.target, [ref]$targetPid)
+        $process = if ($targetPid) { Get-Process -Id $targetPid -ErrorAction SilentlyContinue }
+        if (!$process -or ($req.pid -and $targetPid -ne $req.pid) -or
+            ($req.browser -and $process.ProcessName -ne $req.browser) -or
+            ($cmd -eq 'set' -and !$req.restore -and $w.target -ne [ImeNative]::GetForegroundWindow())) {
+            return @{ ok = $false; error = 'target window changed' }
+        }
+    }
     if ($w.ime -eq [IntPtr]::Zero) {
         Write-DebugLog '  IME ウィンドウを取得できず'
         return @{ ok = $false; error = 'no IME window for target' }
@@ -215,44 +227,52 @@ function Invoke-ImeRequest($req) {
         $convValue = [int]$CONV_BITS[$name]
     } elseif ($null -ne $req.convRaw) {
         $convValue = [int]$req.convRaw
-        $convExact = $true
+        $convExact = !$req.held
     }
 
-    # Conversion-mode writes only stick while the IME is open, so sequence the
-    # two writes around that: open first when turning on, conv first when turning off.
-    if ($open -eq 1) {
-        if ($curOpen -ne 1) { Invoke-ImeControl $w.ime $IMC_SETOPENSTATUS 1 | Out-Null }
-        if ($null -ne $convValue) { Set-ConversionBits $w.ime $curConv $convValue $convExact | Out-Null }
-    } else {
-        if ($null -ne $convValue -and $curOpen -eq 1) {
-            Set-ConversionBits $w.ime $curConv $convValue $convExact | Out-Null
+    $result = @{ ok = $false; hwnd = [int64]$w.target; pid = $targetPid;
+        previous = $curOpen; previousConv = $curConv }
+    if (!$req.restore -and $null -eq $script:lastChange) {
+        $script:lastChange = @{ hwnd = $w.target; pid = $targetPid; open = $curOpen; conv = $curConv }
+    }
+
+    $mask = if ($convExact) { -1 } else { $CONV_MASK }
+    $needsConversion = $null -ne $convValue
+    $writeConversion = $needsConversion -and (($curConv -band $mask) -ne ($convValue -band $mask) -or $open -ne $curOpen)
+    $workingOpen = $curOpen
+    if (($open -eq 1 -or $writeConversion) -and $workingOpen -ne 1) {
+        if ($null -eq (Invoke-ImeControl $w.ime $IMC_SETOPENSTATUS 1)) {
+            $result.error = 'setting IME open timed out'
+            return $result
         }
-        if ($curOpen -ne 0) { Invoke-ImeControl $w.ime $IMC_SETOPENSTATUS 0 | Out-Null }
+        $workingOpen = 1
+    }
+    if ($writeConversion) {
+        $workingConv = Invoke-ImeControl $w.ime $IMC_GETCONVERSIONMODE 0
+        if ($null -eq $workingConv -or !(Set-ConversionBits $w.ime $workingConv $convValue $convExact)) {
+            $result.error = 'setting IME conversion mode timed out'
+            return $result
+        }
+    }
+    if ($workingOpen -ne $open -and $null -eq (Invoke-ImeControl $w.ime $IMC_SETOPENSTATUS $open)) {
+        $result.error = 'setting IME open status timed out'
+        return $result
     }
 
-    if ($req.restore) {
-        $script:lastChange = $null
-    } elseif ($null -eq $script:lastChange) {
-        $script:lastChange = @{ hwnd = $w.target; open = $curOpen; conv = $curConv }
+    # An accepted window message is not proof that the IME applied the change.
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        if ($attempt -gt 0) { Start-Sleep -Milliseconds 25 }
+        $actualOpen = Invoke-ImeControl $w.ime $IMC_GETOPENSTATUS 0
+        $actualConv = Invoke-ImeControl $w.ime $IMC_GETCONVERSIONMODE 0
+        if ($actualOpen -eq $open -and $null -ne $actualConv -and
+            (!$needsConversion -or ($actualConv -band $mask) -eq ($convValue -band $mask))) {
+            $result.ok = $true
+            if ($req.restore) { $script:lastChange = $null }
+            return $result
+        }
     }
-
-    # 書いた結果が実際に残っているかを読み直す。書き込みが受理されたのに
-    # 反映されない（TSF 側で捨てられる）のか、そもそも書いていないのかを分ける。
-    # 直後と少し待った後の 2 回読むのは、TSF が非同期に反映する場合に
-    # 「拒否された」と誤読しないため。参照スクリプトが 1.2 秒待つのと同じ理由。
-    if ($null -ne $script:logPath) {
-        $afterOpen = Invoke-ImeControl $w.ime $IMC_GETOPENSTATUS 0
-        $afterConv = Invoke-ImeControl $w.ime $IMC_GETCONVERSIONMODE 0
-        Write-DebugLog ('  結果(直後): open {0} -> {1} / conv 0x{2:X4} -> 0x{3:X4}' -f
-            $curOpen, $afterOpen, $curConv, $afterConv)
-
-        Start-Sleep -Milliseconds 250
-        $lateOpen = Invoke-ImeControl $w.ime $IMC_GETOPENSTATUS 0
-        $lateConv = Invoke-ImeControl $w.ime $IMC_GETCONVERSIONMODE 0
-        Write-DebugLog ('  結果(250ms後): open {0} / conv 0x{1:X4}' -f $lateOpen, $lateConv)
-    }
-
-    return @{ ok = $true; hwnd = [int64]$w.target; previous = $curOpen; previousConv = $curConv }
+    $result.error = 'IME did not apply the requested state'
+    return $result
 }
 
 try {
@@ -276,12 +296,8 @@ finally {
     # Port died (service worker evicted, extension disabled, browser closed).
     # Never strand the user with the IME in a state they did not choose.
     if ($null -ne $script:lastChange) {
-        $ime = [ImeNative]::ImmGetDefaultIMEWnd($script:lastChange.hwnd)
-        if ($ime -ne [IntPtr]::Zero) {
-            $now = Invoke-ImeControl $ime $IMC_GETCONVERSIONMODE 0
-            # 復帰なので exact。マスクに通すと ROMAN などが落ちる。
-            if ($null -ne $now) { Set-ConversionBits $ime $now $script:lastChange.conv $true | Out-Null }
-            Invoke-ImeControl $ime $IMC_SETOPENSTATUS $script:lastChange.open | Out-Null
-        }
+        Invoke-ImeRequest @{ cmd = 'set'; hwnd = [int64]$script:lastChange.hwnd;
+            pid = $script:lastChange.pid; open = $script:lastChange.open;
+            convRaw = $script:lastChange.conv; restore = $true } | Out-Null
     }
 }

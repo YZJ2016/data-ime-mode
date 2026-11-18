@@ -10,6 +10,8 @@ const MODES = {
   'hiragana':      { open: 1, conv: 'hiragana' },
   'katakana':      { open: 1, conv: 'full-katakana' },
   'full-katakana': { open: 1, conv: 'full-katakana' },
+  'full-alphanumeric': { open: 1, conv: 'full-alphanumeric' },
+  'half-alphanumeric': { open: 1, conv: 'half-alphanumeric' },
   'half-katakana': { open: 1, conv: 'half-katakana' },
 };
 
@@ -48,6 +50,17 @@ function prewarm() {
 }
 
 let currentMode = null;
+let currentField = null;
+let retained = false;
+let request = 0;
+let nextField = 0;
+const heldFields = new WeakMap();
+
+function holdId(el) {
+  if (el?.getAttribute?.('data-ime-hold') !== 'true') return null;
+  if (!heldFields.has(el)) heldFields.set(el, ++nextField);
+  return heldFields.get(el);
+}
 let releaseTimer = null;
 
 function modeOf(el) {
@@ -61,23 +74,26 @@ function modeOf(el) {
 // The send did not land, so we must not keep claiming the mode is applied -
 // apply()'s dedupe would swallow every retry. Only clear if nothing newer has
 // been applied in the meantime.
-function forget(mode) {
-  if (currentMode === mode) currentMode = UNKNOWN;
-}
-
-function apply(mode) {
-  if (mode === currentMode) return;
+function apply(mode, field = null, withinDocument = false) {
+  if (mode === currentMode && field === currentField &&
+      !(mode === null && retained && !withinDocument)) return;
+  retained = withinDocument && mode === null && (currentField !== null || retained);
   currentMode = mode;
+  currentField = field;
+  const id = ++request;
+  const forget = () => {
+    if (request === id) currentMode = UNKNOWN;
+  };
   try {
-    // Extension context invalidated (reload/disable) throws synchronously;
-    // a service worker that cannot be reached rejects the returned promise.
-    // background.js answers every message, so a rejection really means the
-    // message did not arrive - not merely that nobody replied.
-    const sent = chrome.runtime.sendMessage({ type: 'ime', mode, spec: mode ? MODES[mode] : null });
-    if (sent && typeof sent.catch === 'function') sent.catch(() => forget(mode));
+    const message = { type: 'ime', mode, spec: mode ? MODES[mode] : null };
+    if (field !== null) message.field = field;
+    if (withinDocument && mode === null) message.retain = true;
+    const sent = chrome.runtime.sendMessage(message);
+    if (sent && typeof sent.then === 'function') {
+      sent.then(result => { if (result?.ok === false) forget(); }, forget);
+    }
   } catch {
-    // The host restores the IME on port close, so nothing is stranded.
-    forget(mode);
+    forget();
   }
 }
 
@@ -90,14 +106,16 @@ function cancelRelease() {
 
 document.addEventListener('focusin', (e) => {
   cancelRelease();
-  apply(modeOf(e.target));
+  if (!document.hasFocus()) return;
+  const mode = modeOf(e.target);
+  apply(mode, mode ? holdId(e.target) : null, true);
 }, true);
 
 document.addEventListener('focusout', () => {
   cancelRelease();
   releaseTimer = setTimeout(() => {
     releaseTimer = null;
-    apply(null);
+    apply(null, null, document.hasFocus());
   }, RELEASE_DELAY_MS);
 }, true);
 
@@ -117,7 +135,9 @@ function releaseNow() {
 function reapplyNow() {
   if (!document.hasFocus()) return;
   cancelRelease();
-  apply(modeOf(document.activeElement));
+  const el = document.activeElement;
+  const mode = modeOf(el);
+  apply(mode, mode ? holdId(el) : null, true);
 }
 
 window.addEventListener('blur', releaseNow);
