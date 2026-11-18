@@ -36,10 +36,13 @@ function explain(r) {
   switch (classifyHostFailure(r)) {
     case 'unregistered':
       return para(
-        'ホストが登録されていません。',
+        'ネイティブホストが登録されていません。',
         document.createElement('br'),
-        code('powershell -ExecutionPolicy Bypass -File host\install.ps1'),
-        ' を実行し、Edge を完全に終了してから起動し直してください。'
+        'PowerShell で data-ime-mode フォルダを開き、次のコマンドを実行してください。',
+        document.createElement('br'),
+        code('powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\host\\install.ps1'),
+        document.createElement('br'),
+        'Edge と Chrome の両方に登録されます。登録後、使用中のブラウザを完全に終了し、起動し直してください。'
       );
     case 'no-response':
       return para(
@@ -51,9 +54,9 @@ function explain(r) {
         'PowerShell の Constrained Language Mode（AppLocker / WDAC）や EDR が ',
         code('Add-Type'),
         ' の P/Invoke を止めている可能性があります。',
-        code('host\debug.on'),
+        code('host\\debug.on'),
         ' を置くと ',
-        code('host\debug.log'),
+        code('host\\debug.log'),
         ' に記録が残ります。'
       );
     default:

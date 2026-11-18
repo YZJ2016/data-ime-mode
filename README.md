@@ -1,5 +1,7 @@
 # data-ime-mode
 
+日本語 | [简体中文](README.zh-CN.md)
+
 IE の CSS `ime-mode` 相当を、Windows の Edge / Chrome で `data-ime-mode` 属性として再現するブラウザ拡張です。
 
 作った経緯と、`inputmode` や IMM32 では代替できない理由は Zenn の記事「[IE の ime-mode を Edge の拡張機能で再現した](https://zenn.dev/fukunagajiro/articles/data-ime-mode)」に書いています。
@@ -259,7 +261,7 @@ powershell -ExecutionPolicy Bypass -File host\install.ps1
 | 表示 | 意味 | 対処 |
 |---|---|---|
 | ✓ 接続できています | ホストまで往復できている | 欄の挙動を `test\test.html` で確認 |
-| ホストが登録されていません | レジストリに登録がない | `install.ps1` を実行し、ブラウザを再起動 |
+| ネイティブホストが登録されていません | レジストリに登録がない | PowerShell で data-ime-mode フォルダを開き、上記のインストールコマンドを実行して、使用中のブラウザを完全に終了してから起動し直す |
 | 登録されているが往復できない | 旧フォルダを指したままか、ホストが起動できず即終了している | フォルダを移動したなら `install.ps1` を再実行。そうでなければ Constrained Language Mode / EDR が `Add-Type` を止めていないか確認（[既知の制約](#既知の制約)）。`host\debug.on` を置くとログが残る |
 
 #### 拡張機能の一覧にカードが見当たらない
