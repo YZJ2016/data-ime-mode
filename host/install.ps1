@@ -13,7 +13,7 @@ param(
     [string[]]$ExtensionId = 'dncpkhppdjjedljfngmbbafgpifhlkae',
 
     [ValidatePattern('^[a-z0-9_]+(\.[a-z0-9_]+)*$')]
-    [string]$HostName = 'io.github.fukunagajiro.data_ime_mode'
+    [string]$HostName = 'data_ime_mode'
 )
 
 $ErrorActionPreference = 'Stop'

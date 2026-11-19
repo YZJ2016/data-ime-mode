@@ -1,17 +1,15 @@
 // Owns the native port and the "what did we change, and to what" bookkeeping.
 // The host is stateless apart from its own crash-safety restore.
 
-const HOST_NAME = 'io.github.fukunagajiro.data_ime_mode';
+const HOST_NAME = 'data_ime_mode';
+const LEGACY_HOST_NAME = 'io.github.fukunagajiro.data_ime_mode';
 const KEEPALIVE_MS = 20000;
 
 let port = null;
 let seq = 0;
 const waiters = new Map();
 
-// ポートが切れた理由。ホスト未登録なら connectNative は同期的に throw せず、
-// "Specified native messaging host not found." で切断する。popup の診断は
-// この文字列がないと「登録されていない」と「起動したが応答しない」を区別できない。
-let lastDisconnect = null;
+let hostName = HOST_NAME;
 
 // The window we touched and the IME state it had before we touched it.
 let saved = null; // { hwnd, pid, open, conv, windowId }
@@ -28,7 +26,7 @@ let queue = Promise.resolve();
 function connect() {
   if (port) return port;
 
-  port = chrome.runtime.connectNative(HOST_NAME);
+  port = chrome.runtime.connectNative(hostName);
 
   port.onMessage.addListener((msg) => {
     const resolve = waiters.get(msg.id);
@@ -40,20 +38,20 @@ function connect() {
 
   port.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
-    lastDisconnect = err ? err.message : null;
+    const detail = err ? err.message : null;
     if (err) console.warn('[data-ime-mode] native host disconnected:', err.message);
     port = null;
     saved = null;
     owner = null;
     field = null;
-    for (const resolve of waiters.values()) resolve({ ok: false, error: 'disconnected' });
+    for (const resolve of waiters.values()) resolve({ ok: false, error: 'disconnected', detail });
     waiters.clear();
   });
 
   return port;
 }
 
-function call(req) {
+function sendToHost(req) {
   return new Promise((resolve) => {
     let p;
     try {
@@ -74,6 +72,23 @@ function call(req) {
       resolve({ ok: false, error: String(e) });
     }
   });
+}
+
+async function call(req) {
+  const firstHost = hostName;
+  let result = await sendToHost(req);
+  // A missing registration could not have executed the request. Avoid retrying
+  // through another host after a crash or timeout, where the IME may have changed.
+  if (result.error === 'disconnected' && /native messaging host not found/i.test(result.detail)) {
+    if (firstHost === HOST_NAME) {
+      hostName = LEGACY_HOST_NAME;
+      result = await sendToHost(req);
+    }
+    if (result.error === 'disconnected' && /native messaging host not found/i.test(result.detail)) {
+      hostName = HOST_NAME;
+    }
+  }
+  return result;
 }
 
 async function rememberField() {
@@ -153,8 +168,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.probe) {
     enqueue(() =>
       call({ cmd: 'ping' }).then((r) => {
-        if (r && r.ok) sendResponse({ ok: true });
-        else sendResponse({ ok: false, error: (r && r.error) || 'unknown', detail: lastDisconnect });
+        if (r.ok) sendResponse({ ok: true, hostName });
+        else sendResponse({ ok: false, error: r.error || 'unknown', detail: r.detail || null });
       })
     );
     return true;

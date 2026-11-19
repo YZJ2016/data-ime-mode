@@ -66,6 +66,7 @@ function loadContent({ reply = 'ack', sendImpl, attr = 'hiragana', readyState = 
 }
 
 function loadBackground({ respond } = {}) {
+  const connectedHosts = [];
   let listener = null;
   let startupHandler = null;
   const posted = [];
@@ -83,7 +84,7 @@ function loadBackground({ respond } = {}) {
       posted.push(m);
       // 応答ハンドラが登録されていれば非同期で応答を返す
       if (respond && onMessageHandler) {
-        const response = respond(m);
+        const response = respond(m, connectedHosts.at(-1));
         if (response !== undefined) {
           // microtask として実行し、queue が処理できるようにする
           Promise.resolve().then(() => onMessageHandler(response));
@@ -93,7 +94,7 @@ function loadBackground({ respond } = {}) {
   };
   const chrome = {
     runtime: {
-      connectNative: () => { connectStats.count++; return port; },
+      connectNative: (host) => { connectedHosts.push(host); connectStats.count++; return port; },
       onMessage: { addListener: (fn) => { listener = fn; } },
       onStartup: { addListener: (fn) => { startupHandler = fn; } },
       lastError: null,
@@ -109,7 +110,7 @@ function loadBackground({ respond } = {}) {
     if (onDisconnectHandler) onDisconnectHandler();
     chrome.runtime.lastError = null;
   };
-  return { listener, startupHandler, posted, connectStats, disconnect };
+  return { listener, startupHandler, posted, connectStats, disconnect, connectedHosts };
 }
 
 const results = [];
@@ -501,7 +502,7 @@ function check(name, actual, expected) {
     check('probe は同期には応答しない', reply, null);
 
     await sleep(20);
-    check('疎通していれば probe は ok を返す', reply, { ok: true });
+    check('疎通していれば probe は ok を返す', reply, { ok: true, hostName: 'data_ime_mode' });
     // ping だけであること = 疎通確認が IME に触らないこと。
     check('probe はホストへ ping だけを送る', posted.map((m) => m.cmd), ['ping']);
   }
@@ -516,6 +517,8 @@ function check(name, actual, expected) {
 
     let reply = null;
     listener({ type: 'ime', probe: true }, {}, (r) => { reply = r; });
+    await sleep(10);
+    disconnect('Specified native messaging host not found.');
     await sleep(10);
     disconnect('Specified native messaging host not found.');
     await sleep(10);
@@ -631,6 +634,35 @@ function check(name, actual, expected) {
     t.document.fire('focusin', { target: b });
     t.document.fire('focusin', { target: b });
     check('different fields with the same mode each apply it once', t.sent, ['katakana', 'katakana']);
+  }
+
+  {
+    const primary = 'data_ime_mode';
+    const legacy = 'io.github.fukunagajiro.data_ime_mode';
+    const t = loadBackground({
+      respond: (m, host) => host === legacy ? { id: m.id, ok: true } : undefined,
+    });
+    let reply;
+    t.listener({ type: 'ime', probe: true }, {}, r => { reply = r; });
+    await sleep(10);
+    check('fresh connections prefer the installer host name', t.connectedHosts, [primary]);
+    t.disconnect('Specified native messaging host not found.');
+    await sleep(20);
+    check('legacy registration is used only after the new name is missing',
+      t.connectedHosts, [primary, legacy]);
+    check('probe shows which host answered', reply?.hostName, legacy);
+  }
+
+  {
+    const t = loadBackground();
+    let reply;
+    t.listener({ type: 'ime', probe: true }, {}, r => { reply = r; });
+    await sleep(10);
+    t.disconnect('Native host has exited.');
+    await sleep(20);
+    check('a host that registered but failed to start does not fall back',
+      t.connectedHosts, ['data_ime_mode']);
+    check('startup failure is preserved', reply?.detail, 'Native host has exited.');
   }
 
   // ---- 結果 ----------------------------------------------------------------

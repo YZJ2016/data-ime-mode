@@ -3,12 +3,13 @@
 // Add-Type が塞がれている、は利用者から見て同じ「何も起きない」に見えるので、
 // ここで切り分けられないと切り分ける場所がない。
 
-const HOST_NAME = 'io.github.fukunagajiro.data_ime_mode';
+const HOST_NAME = 'data_ime_mode';
 
 const statusEl = document.getElementById('status');
 const detailEl = document.getElementById('detail');
 
-document.getElementById('hostname').textContent = HOST_NAME;
+const hostNameEl = document.getElementById('hostname');
+hostNameEl.textContent = HOST_NAME;
 document.getElementById('extid').textContent = chrome.runtime.id;
 
 function show(cls, text, detailHtml) {
@@ -71,6 +72,7 @@ function check() {
       show('ng', '× 拡張機能に接続できません', para(chrome.runtime.lastError.message));
       return;
     }
+    hostNameEl.textContent = r?.hostName || HOST_NAME;
     if (r && r.ok) show('ok', '✓ ネイティブホストに接続できています');
     else show('ng', '× ネイティブホストに接続できません', explain(r));
   });
